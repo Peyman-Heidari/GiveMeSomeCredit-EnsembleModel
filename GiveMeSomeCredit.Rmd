@@ -1,0 +1,551 @@
+---
+title: "Give Me Some Credit: Machine learning to predict financial difficulty"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=T, message=F, warning=F, echo = TRUE)
+set.seed(7)
+setwd("C:/Github/GiveMeCredit")
+library(data.table); library(ggplot2); library(gridExtra); library(caret)
+library(MLmetrics); library(polycor) ;library(pROC); library(ROCR)
+library(h2o); library(xgboost)
+```
+
+## R Markdown
+
+You can try the [Shiny App](https://peymanh.shinyapps.io/loan_default) made for this project.
+
+Banks play a crucial role in market economies. They decide who can get finance and on what terms and can make or break investment decisions. For markets and society to function, individuals and companies need access to credit. 
+
+Credit scoring algorithms, which make a guess at the probability of default, are the method banks use to determine whether or not a loan should be granted. Here I try to improve on the state of the art in credit scoring, by predicting the probability that somebody will experience financial distress in the next two years.
+
+This project was a [Kaggle competition](https://www.kaggle.com/c/GiveMeSomeCredit).
+
+
+## Data
+
+Data contains a label (SeriousDlqin2yrs (Delinquent):Person experienced 90 days past due delinquency or worse )  and the following information about each person.
+
+- RevolvingUtilizationOfUnsecuredLines (Line_usage):	Total balance on credit cards and personal lines of credit except real estate and no installment debt like car loans divided by the sum of credit limits
+
+- age (age):	Age of borrower in years
+
+- NumberOfTime30-59DaysPastDueNotWorse (Late30_59):	Number of times borrower has been 30-59 days past due but no worse in the last 2 years.
+
+- DebtRatio (Debt_ratio):	Monthly debt payments, alimony,living costs divided by monthy gross income
+
+- MonthlyIncome	Monthly (Monthly_income): income
+
+- NumberOfOpenCreditLinesAndLoans (Credit_lines):	Number of Open loans (installment like car loan or mortgage) and Lines of credit (e.g. credit cards)
+
+- NumberOfTimes90DaysLate (Late90):	Number of times borrower has been 90 days or more past due.
+
+- NumberRealEstateLoansOrLines (Real_estate_loans):	Number of mortgage and real estate loans including home equity lines of credit
+
+- NumberOfTime60-89DaysPastDueNotWorse (Late60_89):	Number of times borrower has been 60-89 days past due but no worse in the last 2 years.
+
+- NumberOfDependents (Dependents):	Number of dependents in family excluding themselves (spouse, children etc.)
+
+
+```{r loan_data}
+loan_data<- read.csv("cs-training.csv", header = TRUE)
+loan_data <- data.table(loan_data)
+loan_data <- loan_data[, !"X", with=FALSE]
+
+colnames(loan_data) <- c("Delinquent", "Line_usage", "age", "Late30_59",
+                         "Debt_ratio", "Monthly_income", "Credit_lines",
+                         "Late90", "Real_estate_loans", "Late60_89",
+                         "Dependents")
+
+summary(loan_data)
+```
+Two features have NAs. Number of dependents and monthly income. These issues need to be fixed before starting to train machine learning algorithms.
+
+## Data Partitioning
+```{r , echo=T}
+INtraining_validation<- createDataPartition(loan_data$Delinquent,
+                                            p=0.8,
+                                            list=FALSE)
+training_validation<- loan_data[INtraining_validation,]
+testing<- loan_data[-INtraining_validation,]
+
+INtraining<- createDataPartition(training_validation$Delinquent,
+                                 p=0.8,
+                                 list=FALSE)
+training<- training_validation[INtraining,]
+validation<- training_validation[-INtraining,]
+
+```
+We divided our dataset into train, validation and test form the begining of the analysis. There are `r dim(training)[1]` records in the training dataset, `r dim(validation)[1]` records in the validation dataset, and `r dim(testing)[1]` records in the testing dataset. 
+
+## Exploratory Data Analysis
+
+In this section we will take a look at the data and some univariate and bivariate plots.
+
+```{r , echo=TRUE}
+delinq_ratio <- sum(training$Delinquent)/dim(training)[1]
+
+```
+number of delinquents is: `r sum(training$Delinquent)` , which is only `r delinq_ratio` of all the training data.
+
+### Distribution of features
+```{r distribution, fig.height=6,  fig.width=10, echo=T}
+
+g1 <- ggplot(aes(x=Delinquent), data=training)+
+    geom_histogram(fill= 'red')
+g2 <- ggplot(aes(x=Line_usage), data=training)+
+    geom_histogram(fill= 'red')
+g3 <- ggplot(aes(x=age), data=training)+
+    geom_histogram(fill= 'red')
+g4 <- ggplot(aes(x=Late30_59), data=training)+
+    geom_histogram(fill= 'red')
+g5 <- ggplot(aes(x=Debt_ratio), data=training)+
+    geom_histogram(fill= 'red')
+g6 <- ggplot(aes(x=Monthly_income), data=training)+
+    geom_histogram(fill= 'red')
+g7 <- ggplot(aes(x=Credit_lines), data=training)+
+    geom_histogram(fill= 'red')
+g8 <- ggplot(aes(x=Late90), data=training)+
+    geom_histogram(fill= 'red')
+g9 <- ggplot(aes(x=Real_estate_loans), data=training)+
+    geom_histogram(fill= 'red')
+g10 <- ggplot(aes(x=Late60_89), data=training)+
+    geom_histogram(fill= 'red')
+g11 <- ggplot(aes(x=Dependents), data=training)+
+    geom_histogram(fill= 'red')
+grid.arrange(g1,g2,g3,g4,g5,g6,g7,g8,g9,g10,g11, ncol=4)
+```
+
+As it can be seen only number of credit lines resemble a distribution close to the normal distribution. Many of the variables have long tails that might be errors in data or reality and need to be studied more. 
+
+```{r bol , echo=TRUE}
+num_line_overage <- dim(training[training$Line_usage>1])[1]
+num_line_overage_del <- sum(training$Delinquent[training$Line_usage>1])
+dlq_if_overage <- num_line_overage_del/ num_line_overage
+summary(training$Line_usage)
+```
+probability of being delinquent if your balance is higher than limit is `r dlq_if_overage`, which suggest a strong association
+
+```{r , echo=TRUE}
+under_18 <- sum(training$age<18)
+
+```
+There is `r under_18` applicant in the system, which does not make sense and needs to be removed.
+
+```{r , echo=TRUE}
+table(training$Dependents)
+```
+Most applicants do not have any dependents and there is one with 20. However, we do not remove these records, since it is possible that some applicants have a lot of dependents.
+
+```{r , echo=TRUE}
+table(training$Real_estate_loans)
+```
+Most applicants do not have more than a few real estate loans. However, there are some with more than 20. Although it is possible that an applicant has more than 20 loans, these records are going to be removed since they are outliers.
+
+
+```{r , echo=TRUE}
+summary(training$Monthly_income)
+```
+The monthly income feature is the most challenging feature in this analysis. It is highly skewed and there are a lot of NAs. NAs will be imputed and records that have monthly income of more than $200,000 will be removed.
+
+
+```{r , echo=TRUE}
+num_late <- length(training$Delinquent[(training$Late30_59>30)&
+                                           (training$Late90>30) &
+                                           (training$Late60_89>30)])
+
+num_late_dlq <- sum(training$Delinquent[(training$Late30_59>30)&
+                                            (training$Late90>30) &
+                                            (training$Late60_89>30)])
+dlq_if_late <- num_late_dlq/num_late
+table(training$Late30_59)
+table(training$Late60_89)
+table(training$Late90)
+```
+There are people that have missed more than 90 loan payments in the past. At first, my idea was to remove these but then I realized that this might be a very important feature to identify the risky applicants. I found out that `r dlq_if_late` of people who have missed more than 30 payments are labeled and delinquent.
+
+## Data cleaning and transformation
+
+Line usage, debt ratio, and monthly income is highly skewed. In order to prepare the data for machine learning, log transformation was performed on these features. In addition, since NA in number of dependents probably mean 0, we set NAs for this feature 0.
+
+```{r , echo=TRUE}
+training <- training[training$age>18]
+training <- training[training$Real_estate_loans<20]
+training <- training[training$Monthly_income<200000 |
+                         is.na(training$Monthly_income)]
+
+loan_transformer <- function(data){
+    data$Log_line_usage <- log(data$Line_usage+1e-8)
+    data$Log_debt_ratio <- log(data$Debt_ratio+1e-8)
+    data$Log_monthly_income <- log(data$Monthly_income+1e-8)
+    data <- data[,c("Line_usage", "Debt_ratio", "Monthly_income"):=NULL]
+    data$Dependents[is.na(data$Dependents)] <- 0
+    data$Delinquent <- factor(data$Delinquent, levels=c(0,1),
+                                 labels=c("Safe", "Risky"))
+    return(data)
+}
+
+training <- loan_transformer(training)
+testing <- loan_transformer(testing)
+validation <- loan_transformer(validation)
+
+```
+
+## Imputation
+The only feature with a lot of NAs remaining is the monthly income. My idea initially was to use KNN to imput these values but then moved to using a linear regression due to the higher speed of the algorithm.
+```{r , echo=TRUE}
+income_Imputer <- train(Log_monthly_income ~ .,
+                     data = training[!is.na(training$Log_monthly_income)
+                                     , !c("Delinquent"), with=FALSE],
+                     method="lm")
+
+
+training$Log_monthly_income[is.na(training$Log_monthly_income)]=
+    predict(income_Imputer, newdata = training[is.na(training$Log_monthly_income)
+                                           , !c("Delinquent"), with=FALSE] )
+
+testing$Log_monthly_income[is.na(testing$Log_monthly_income)]=
+    predict(income_Imputer, newdata = testing[is.na(testing$Log_monthly_income)
+                                               , !c("Delinquent"), with=FALSE] )
+
+
+validation$Log_monthly_income[is.na(validation$Log_monthly_income)]=
+    predict(income_Imputer, newdata = validation[is.na(validation$Log_monthly_income)
+                                              , !c("Delinquent"), with=FALSE] )
+
+```
+
+## Bi-variate Analysis
+to using a linear regression due to the higher speed of the algorithm.
+```{r , echo=TRUE}
+hetcor(training, std.err=F )
+```
+The strength of association analysis shows relatively medium association between Delinquent and four features; Late90, Log_line_usage, Log_debt_ratio, and age. We will study these more in detail
+
+Figure 2 demonstrates that a large portion of Risky applicatant have higher revolving line usages and have missed payments for over 90 days.
+
+```{r , echo=TRUE}
+g_f_3 <- ggplot(aes(y=Late90,x=Log_line_usage),data=training)+
+    geom_point(aes(color=Delinquent), alpha=0.2)+
+    scale_colour_manual(name="",  values =c("forestgreen",  "firebrick2"))+
+    ylim(c(0,15))+ylab('Number of over 90 days late payements')+ 
+    xlab('Log of revolving credit line usage')+
+    labs(title = 
+             "Figure 2: Riskiness of a loan based on late payments
+         and credit line usage") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+g_f_3
+```
+
+As it can be seen in Figure 3, debt to income ratio does not create a sensible distiction between the Risky and Safe applicants.
+
+```{r , echo=TRUE}
+g_f_4 <- ggplot(aes(y=Log_debt_ratio,x=Log_line_usage),data=training)+
+    geom_point(aes(color=Delinquent), alpha=0.2)+
+    scale_colour_manual(name="",  values =c("forestgreen",  "firebrick2"))+
+    ylim(c(-10,10))+
+    xlim(c(-10,10))+
+    ylab('Log of debt  to income ratio')+ 
+    xlab('Log of revolving credit line usage')+
+    labs(title = 
+             "Figure 3: Riskiness of a loan based on debt to income ratio
+         and credit line usage") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+g_f_4
+```
+
+Figure 4 shows that younger applicant are more probable to be Risky if they have used most of their credit line.
+
+```{r , echo=TRUE}
+g_f_5 <- ggplot(aes(y=age,x=Log_line_usage),data=training)+
+    geom_point(aes(color=Delinquent), alpha=0.2)+
+    scale_colour_manual(name="",  values =c("forestgreen",  "firebrick2"))+
+    #ylim(c(-10,10))+
+    xlim(c(-10,10))+
+    ylab('Age')+ 
+    xlab('Log of revolving credit line usage')+
+    labs(title = 
+             "Figure 4: Riskiness of a loan based on age
+         and credit line usage") +
+    theme(plot.title = element_text(hjust = 0.5))
+
+g_f_5
+```
+
+## Machine Learning
+
+In this part, we will focus on training different machine learning algorithms on the training dataset.
+Since we have imbalance data and just under 7% of the data is Risky. Therefore, I am going to use ROC to evaluate and select the models. All algorithms are tuned using a 5-fold cross validation proecss.
+
+### Decision Tree
+
+```{r , echo=TRUE}
+train_control <- trainControl(method="repeatedcv", number=5, summaryFunction = twoClassSummary, 
+                              classProbs = TRUE, savePredictions = T)
+
+dt <- train(Delinquent~., data=training, method='rpart',
+            trControl=train_control, tuneLength = 3, metric = "ROC")
+dt_prediction <- predict(dt, newdata=validation)
+dt_prediction_prob <- predict(dt, newdata=validation, type='prob')
+dt
+```
+ROC of the decision tree algorithm is just 0.657, which is not impressive.
+
+### Random Forest
+
+```{r , echo=TRUE}
+rf <- train(Delinquent~., data=training, method='rf',
+            trControl=train_control, tuneLength = 3, metric = "ROC")
+rf_prediction <- predict(rf, newdata=validation)
+rf_prediction_prob <- predict(rf, newdata=validation, type='prob')
+rf_prediction_test_prob <- predict(rf, newdata=testing, type='prob')
+rf
+```
+ROC of the random forest algorithm jumped to 0.848, which is a big improvement over the decision tree.
+
+### Extreme Gradient Boosting 
+
+```{r , echo=T, results='hide'}
+train_xgb <- function(training, validation){
+    traind <- xgb.DMatrix(data = as.matrix(training[,-1])
+                          , label = as.numeric(training$Delinquent=="Risky"))
+    validd<- xgb.DMatrix(data = as.matrix(validation[,-1])
+                         , label = as.numeric(validation$Delinquent=="Risky"))
+    
+    watch_list <- list(train=traind, test=validd)
+    
+    Extreme_gb <- xgb.train(data=traind,
+                            eta=.01,
+                            eval.metric = "error",
+                            watchlist=watch_list,
+                            max.depth=3,
+                            nthread = 6,
+                            nround=2000,
+                            eval.metric = "auc",
+                            objective = "binary:logistic")
+    return(Extreme_gb)
+}
+
+predict_xgb <- function(Extreme_gb, validation){
+    validd<- xgb.DMatrix(data = as.matrix(validation[,-1])
+                         , label = as.numeric(validation$Delinquent=="Risky"))
+    xgb_prediction_prob<-predict(Extreme_gb,validd)
+    return(xgb_prediction_prob)
+}
+
+Extreme_gb <- train_xgb(training, validation)
+xgb.save(Extreme_gb, "Extreme_gb")
+xgb_prediction_prob<-predict_xgb(Extreme_gb,validation)
+
+xgb_prediction <- ifelse(xgb_prediction_prob>0.5, "Risky", "Safe")
+prediction_gb <- prediction(xgb_prediction_prob, as.numeric(validation$Delinquent=='Risky'))
+auc_gb <- performance(prediction_gb, measure = "auc")
+auc_gb <- auc_gb@y.values[[1]]
+
+xgb_prediction_test_prob<-predict_xgb(Extreme_gb,testing)
+prediction_gb_t <- prediction(xgb_prediction_test_prob, as.numeric(testing$Delinquent=='Risky'))
+auc_gb_t <- performance(prediction_gb_t, measure = "auc")
+auc_gb_t <- auc_gb_t@y.values[[1]]
+```
+ROC of the XGB algorithm jumped to `r auc_gb`, which is still increasing over ROC of the random forest.
+
+### Deep Learning
+
+```{r , echo=T, results='hide'}
+write.csv(training, 'trainx.csv', row.names=FALSE)
+write.csv(validation, 'validx.csv', row.names=FALSE)
+write.csv(testing, 'testx.csv', row.names=FALSE)
+train_dl <- function(training, validation){
+    write.csv(training, 'traintemp.csv', row.names=FALSE)
+    write.csv(validation, 'validtemp.csv', row.names=FALSE)
+    h2o.init(nthreads=-1, max_mem_size="2G")
+    h2o.removeAll()
+    trainh <- h2o.importFile(path = normalizePath("C:/Github/GiveMeCredit/traintemp.csv"))
+    validh <- h2o.importFile(path = normalizePath("C:/Github/GiveMeCredit/validtemp.csv"))
+    response <- "Delinquent"
+    predictors <- setdiff(names(trainh), response)
+    hyper_params <- list(
+        activation=c("RectifierWithDropout", "TanhWithDropout"),
+        hidden=list(c(50,50), c(100,100), c(50,25)))
+    dl_random_grid <- h2o.grid(
+        algorithm="deeplearning",
+        grid_id = "dl_grid_random",
+        training_frame=trainh,
+        validation_frame=validh, 
+        x=predictors, 
+        y=response,
+        nfolds=5,
+        stopping_metric="logloss",
+        stopping_tolerance=2e-3,
+        fold_assignment="Stratified",  
+        hyper_params = hyper_params,
+        seed = 42) 
+    grid <- h2o.getGrid("dl_grid_random")
+    DL_model <- h2o.getModel(grid@model_ids[[1]])
+    return (DL_model)
+}
+
+predict_dl <- function(DL_model, validation){
+    write.csv(validation, 'validtemp.csv', row.names=FALSE)
+    validh <- h2o.importFile(path = normalizePath("C:/Github/GiveMeCredit/validtemp.csv"))
+    DL_predict <- h2o.predict(DL_model, validh)
+    DL_prediction_prob <- as.data.table(DL_predict[,c("Risky", "Safe")])
+    DL_prediction_prob <- DL_prediction_prob$Risky
+    return(DL_prediction_prob)
+}
+
+DL_model <- train_dl(training, validation)
+DL_prediction_prob <-predict_dl(DL_model, validation)
+h2o.saveModel(object=DL_model,path=getwd(), force=TRUE)
+```
+```{r , echo=T}
+DL_model
+```
+ROC of the deep learning is 0.854 , It is not as high as XGB at this stage.
+
+### gbm
+```{r , echo=T, results='hide'}
+train_ada <- function(training){
+    gbm_ada <- train(Delinquent~.
+                     ,data = training
+                     ,method = "gbm"
+                     ,trControl = train_control
+                     ,verbose = TRUE
+                     ,tuneLength = 3
+                     , metric = 'ROC')
+    return(gbm_ada)
+}
+predict_ada <- function(gbm_ada,validation){
+    ada_prediction_prob <- predict(gbm_ada, newdata=validation, type='prob')
+    ada_prediction_prob <- ada_prediction_prob$Risky
+    return (ada_prediction_prob)
+}
+gbm_ada<- train_ada(training)
+ada_prediction_prob <- predict_ada(gbm_ada, validation)
+save(gbm_ada, file="gbm_ada.RData")
+```
+```{r , echo=T}
+gbm_ada
+```
+ROC of the gbm is 0.862 , It is not as high as XGB but higher than deep learning and random forest.
+
+### Naive Bayes
+```{r , echo=T, results='hide'}
+
+train_nb <- function(training){
+    nb <- train(Delinquent~.
+                     ,data = training
+                     ,method = "nb"
+                     ,trControl = train_control
+                     ,verbose = TRUE
+                     ,tuneLength = 3
+                     , metric = 'ROC')
+    return(nb)
+}
+
+predict_nb <- function(nb, validation){
+    nb_prediction_prob <- predict(nb, newdata=validation, type='prob')
+    nb_prediction_prob <- nb_prediction_prob$Risky
+    return (nb_prediction_prob)
+}
+
+nb <- train_nb(training)
+nb_prediction_prob <- predict_nb(nb, validation)
+save(nb, file="nb.RData")
+```
+```{r , echo=T}
+nb
+```
+ROC of the Naive Bayes is 0.852 , It is not as high as XGB but it still can be useful in model stacking.
+
+### Model Stacking
+Model Satcking is a well-known practice to boost model performance. Here we used a 5-fold stratified shuffel and trained the XGB, gbm, and deep learning models on 4 folds and then predicted the fifth fold. This process was performed 5 times and at the end a new dataset was created. The columns in this dataset are Delinquent (label), risk probability from XGB,risk probability from gbm, and risk probability from deep learning.
+
+Finally XGB was once more used to tune a new model on the new dataset using cross validation.
+```{r , echo=T, results="hide"}
+ensemble_prepar_it <- function(valid_train){
+    ens_df <- data.frame(Delinquent= factor(),
+                         xgb=double(),
+                         dl=double(), 
+                         ada=double(),
+                         stringsAsFactors=FALSE)
+    folds <- createFolds(valid_train$Delinquent, k=5)
+    for (i in 1:5){
+        this_fold <- paste0("Fold", toString(i))
+        indexes <- folds[[this_fold]]
+        in_train <- valid_train[-indexes,]
+        in_test <- valid_train[indexes,]
+        xgb <- train_xgb(in_train, in_test)
+        dl <- train_dl(in_train, in_test)
+        ada <- train_ada(in_train)
+        xgb_prob <- predict_xgb(xgb, in_test)
+        dl_prob <- predict_dl(dl, in_test)
+        ada_prob <- predict_ada(ada, in_test)
+        ens_df_temp <- data.frame(Delinquent= in_test$Delinquent,
+                                  xgb=xgb_prob,
+                                  dl=dl_prob, 
+                                  ada=ada_prob,
+                                  stringsAsFactors=FALSE)
+        ens_df <- rbind(ens_df , ens_df_temp)
+    }
+    return (ens_df)
+}
+valid_train  <- rbind(validation, training)
+ens_df <- ensemble_prepar_it(valid_train)
+
+```
+
+---
+## Model Evaluation
+The final ensemble model was trained on the best parameter and AUC was measured on the testing dataset.
+
+```{r , echo=T, results="hide"}
+ens_test_df <- data.frame(Delinquent= testing$Delinquent,
+                          xgb=predict_xgb(Extreme_gb, testing),
+                          dl=predict_dl(DL_model,testing), 
+                          ada=predict_ada(gbm_ada, testing),
+                          stringsAsFactors=FALSE)
+
+ens_df_x <- xgb.DMatrix(data = as.matrix(ens_df[,-1])
+                      , label = as.numeric(ens_df$Delinquent=="Risky"))
+ens_test_df_x <- xgb.DMatrix(data = as.matrix(ens_test_df[,-1])
+                     , label = as.numeric(ens_test_df$Delinquent=="Risky"))
+
+watch_list <- list(train=ens_df_x, test=ens_test_df_x)
+
+ensemble_xgb <- xgb.cv(data=ens_df_x,
+                       max.depth=3,
+                       eta=0.01,
+                       nround=2000,
+                       nfold=5,
+                       eval.metric = "error",
+                       nthread = 6,
+                       eval.metric = "auc",
+                       objective = "binary:logistic")
+
+Extreme_xgb <- xgb.train(data=ens_df_x,
+                        max.depth=3,
+                        eta=0.01,
+                        eval.metric = "error",
+                        watchlist=watch_list,
+                        nround=2000,
+                        eval.metric = "error",
+                        nthread = 6,
+                        eval.metric = "auc",
+                        objective = "binary:logistic")
+xgb.save(Extreme_xgb, "Extreme_xgb")
+ens_prediction_test_prob <-predict(Extreme_xgb,ens_test_df_x)
+prediction_test_ens <- prediction(ens_prediction_test_prob, as.numeric(ens_test_df$Delinquent=='Risky'))
+auc_test_ens <- performance(prediction_test_ens, measure = "auc")
+auc_test_ens <- auc_test_ens@y.values[[1]]
+save.image("endofens.RData")
+
+```
+ROC of the stacked model trained with XGB is `r auc_test_ens`. 
+
+## To DO 
+
+Feature engineering and feature selection or dimensionality reduction.
